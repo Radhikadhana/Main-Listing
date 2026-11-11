@@ -1,0 +1,2049 @@
+"""
+Marketplace Bulk Upload Sheet Generator
+========================================
+"""
+
+import io
+import re
+from collections import OrderedDict
+
+import pandas as pd
+import numpy as np
+import streamlit as st
+
+# ======================================================================================
+# CONFIG
+# ======================================================================================
+
+MASTER_COLS = {
+    # Defaults below match your actual Master Sheet's real header names
+    # exactly, so the "Map Master Sheet columns" dropdowns auto-select
+    # correctly on upload -- no manual clicking needed for the common case.
+    "style_no": "StyleNo",
+    "color_no": "ColorNumber",
+    "brand": "Brand",
+    "gender": "Gender",
+    "title": "RegionalDisplayName",
+    "color_family": "ColorName",
+    "color_name": "ColorName",
+    "search_color_name": "Search Color Name",
+    "size": "Size",
+    "uk_size": "SizeUK",
+    "sku": "EAN",
+    "price": "Price",
+    "description": "LongDescription",
+    "care": "Care",
+    "care_label": "Care Label",
+    "category_hint": "Category",
+    "footwear_color": "Footwear Color",
+    "product_type": "ProductDivision",
+    "age_group": "Age Group",
+    "article_group": "Article Group",
+    "article_type": "Article Type",
+    "activity_group": "Activity Group",
+    "collection": "Collection",
+    "material": "Material",
+    "material_local": "Material (English)",
+    "upper_material": "Upper Material",
+    "mid_sole_material": "Mid Sole Material",
+    "outer_sole_material": "Outer Sole Material",
+    "shell_material": "Shell Material",
+    "toe_type": "Toe Type",
+    "heel_type": "Heel Type",
+    "fastener": "Fastener",
+    "fit": "Fit",
+    "puma_technology": "Puma Technology",
+    "technology_purpose": "Technology Purpose",
+}
+
+MASTER_COLS_FIELDS = [
+    ("style_no", "Style Number", True),
+    ("color_no", "Color Number (Footwear)", True),
+    ("brand", "Brand", True),
+    ("gender", "Gender", True),
+    ("title", "Regional Display Name (used in Title)", True),
+    ("color_name", "Color Name (used in Variation 1)", True),
+    ("search_color_name", "Search Color Name (used in Title/Short Description, code stripped)", False),
+    ("size", "Size", False),
+    ("uk_size", "UK Size (used in Variation 2)", True),
+    ("sku", "SKU", True),
+    ("description", "Description", True),
+    ("care", "Care", False),
+    ("care_label", "Care Label", False),
+    ("footwear_color", "Footwear Color (legacy, no longer used in Title)", False),
+    ("product_type", "Product Division (Footwear/Apparel/Accessories)", True),
+    ("age_group", "Age Group", False),
+    ("article_group", "Article Group", False),
+    ("article_type", "Article Type", False),
+    ("activity_group", "Activity Group (used in Short Description)", False),
+    ("collection", "Collection (used in Short Description)", False),
+    ("material", "Material (used in Short Description)", False),
+    ("material_local", "Material Local / English (used in Short Description)", False),
+    ("upper_material", "Upper Material (used in Short Description)", False),
+    ("mid_sole_material", "Mid Sole Material (used in Short Description)", False),
+    ("outer_sole_material", "Outer Sole Material (used in Short Description)", False),
+    ("shell_material", "Shell Material (used in Short Description)", False),
+    ("toe_type", "Toe Type (used in Short Description)", False),
+    ("heel_type", "Heel Type (used in Short Description)", False),
+    ("fastener", "Fastener (used in Short Description)", False),
+    ("fit", "Fit (used in Short Description)", False),
+    ("puma_technology", "PUMA Technology (used in Short Description)", False),
+    ("technology_purpose", "Technology Purpose (used in Short Description)", False),
+]
+
+IMAGE_SHEET_COLS = {
+    "sku": "ColorNumber",
+    "url_col": "Product Image URL(s)",
+}
+
+# All three mapping sheets (Category, Size Chart, Size Chart Template) now
+# share the SAME literal composite key column header:
+#   "Age Group+Gender+Article Group+Article Type+Activity Group+Product Division"
+# built from the Master Input Sheet's respective columns, joined with "+".
+COMPOSITE_KEY_COLUMN_NAME = "Age Group+Gender+Article Group+Article Type+Activity Group+Product Division"
+
+SIZE_CHART_IMAGE_COLS = {
+    "composite_key": COMPOSITE_KEY_COLUMN_NAME,  # PRIMARY match: shared composite key
+    "gender_article_key": "Gender_ArticleGroup",  # your actual Size Chart Sheet header
+    "title_keyword": "Title",                     # fallback only
+    "image_url": "Size chart link",  # matches your actual Size Chart Sheet header -> output "Size chart Image URL"
+    "style_no": "Style Number",       # fallback only
+}
+
+SIZE_CHART_TEMPLATE_COLS = {
+    "key": COMPOSITE_KEY_COLUMN_NAME,  # PRIMARY match: shared composite key
+    "template_attribute_1": "size chart template",  # matches your actual Size Chart Template Sheet header -> output "Template Attribute 1"
+}
+
+CATEGORY_SHEET_COLS = {
+    "composite_key": COMPOSITE_KEY_COLUMN_NAME,  # PRIMARY match: shared composite key
+    "category_name": "Category Name",  # fallback only (breadcrumb-style name, attribute-substring scoring)
+    "keyword": "Title Keyword",        # fallback only (exact keyword sheet, if you have one)
+    "category_id": "Category ID",
+}
+
+# Lazada Item Spec sheet (LAZADA ONLY): maps a Category ID to fixed
+# Product Specification 4-12 values (e.g. "normal.material_filter=Rubber").
+# The Product Specification 4..12 column names match the OUTPUT column
+# names exactly, so they're copied straight across once matched -- only
+# the Category ID key column needs mapping.
+LAZADA_ITEM_SPEC_COLS = {
+    "cat_id": "Cat ID",
+}
+LAZADA_ITEM_SPEC_VALUE_COLUMNS = [f"Product Specification {n}" for n in range(4, 13)]
+
+
+REGION_CURRENCY = {"SG": "SGD", "MY": "MYR", "PH": "PHP"}
+MARKETPLACES = ["Lazada", "Shopee", "Zalora", "Tiktok"]
+REGIONS = ["SG", "MY", "PH"]
+USER_TEMPLATE_NAME = "userTemplate-PumaAccessories"
+
+TITLE_REPLACEMENTS = OrderedDict([
+    (r"\bTrainers\b", "Shoes"),
+    (r"\bSandals\b", "Sports Sandals"),
+    (r"\bSlides\b", "Slides Slippers"),
+])
+
+ALPHA_SIZE_ORDER = ["XXXS", "XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL", "OSFA", "Youth"]
+
+
+# ======================================================================================
+# HELPERS
+# ======================================================================================
+
+def clean_color_name(raw):
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    s = str(raw).strip()
+    if s.lower() in ("", "nan"):
+        return ""
+    if " - " in s:
+        s = s.split(" - ")[-1].strip()
+    if re.fullmatch(r"[\d_\-\s]+", s):
+        return ""
+    s = re.sub(r"^[\d_]+[\s\-_]*", "", s).strip()
+    return s
+
+
+def guess_column_index(options, preferred_name, keywords):
+    norm_options = [str(o).strip().lower() for o in options]
+    preferred_norm = str(preferred_name).strip().lower()
+    if preferred_norm in norm_options:
+        return norm_options.index(preferred_norm)
+    for kw in keywords:
+        kw_norm = kw.strip().lower()
+        for i, opt in enumerate(norm_options):
+            if kw_norm in opt:
+                return i
+    return 0
+
+
+def guess_column_or_none(options, preferred_name, keywords):
+    """
+    Like guess_column_index, but returns None (instead of falling back to
+    index 0 / the first column) when nothing actually matches. Use this for
+    OPTIONAL fields, where guessing a random unrelated column would be worse
+    than correctly leaving the field unmapped.
+    """
+    norm_options = [str(o).strip().lower() for o in options]
+    preferred_norm = str(preferred_name).strip().lower()
+    if preferred_norm in norm_options:
+        return options[norm_options.index(preferred_norm)]
+    for kw in keywords:
+        kw_norm = kw.strip().lower()
+        for i, opt in enumerate(norm_options):
+            if kw_norm in opt:
+                return options[i]
+    return None
+
+
+# Known real-world header naming conventions seen across different Master
+# Sheets in this org: some use compact camel-case ("StyleNo", "ColorNumber"),
+# others use verbose spaced names with "(English)" suffixes ("Style Number",
+# "Regional Display Name (English)"). Rather than hardcoding ONE convention
+# as the default (which breaks the other sheet format), every candidate
+# below is tried in order -- exact match first across ALL candidates, then
+# substring keyword match -- so auto-detection works for either sheet style
+# with zero manual clicking.
+MASTER_COLS_CANDIDATES = {
+    "style_no": ["StyleNo", "Style No", "Style No.", "Style Number", "Style_No"],
+    "color_no": ["ColorNumber", "Color Number", "Color No", "Color No.", "Colour Number"],
+    "brand": ["Brand"],
+    "gender": ["Gender"],
+    "title": ["RegionalDisplayName", "Regional Display Name (English)", "Regional Display Name"],
+    "color_name": ["ColorName", "Color Name"],
+    "search_color_name": ["Search Color Name", "SearchColorName"],
+    "uk_size": ["SizeUK", "UK Size", "Print Size Code (UK)", "Size UK"],
+    "sku": ["EAN", "SKU"],
+    # "description" MUST resolve to the LONG/full description (used to build
+    # Template Attribute 2/3), never the short one -- "short description" is
+    # explicitly excluded even if it contains the word "description".
+    "description": ["LongDescription", "Long Description (English)", "Long Description", "Description"],
+    "product_type": ["ProductDivision", "Product Division", "Product Type"],
+}
+
+
+def guess_master_column(options, field_key, fallback_header):
+    """
+    Tries every known naming-convention candidate for `field_key` (see
+    MASTER_COLS_CANDIDATES) against `options`: exact match first (checked
+    across ALL candidates before falling back to substring matching), then
+    a substring keyword match using each candidate as a keyword. A column
+    containing "short" is explicitly excluded when matching "description",
+    so "Short Description (English)" is never mistaken for the long/full
+    description. Falls back to `fallback_header` (single exact-match
+    attempt) if no candidate list exists for this field. Returns None if
+    nothing matches -- never guesses a wrong column.
+    """
+    candidates = MASTER_COLS_CANDIDATES.get(field_key, [fallback_header])
+    norm_options = [str(o).strip().lower() for o in options]
+
+    is_description_field = field_key == "description"
+
+    # Pass 1: exact match against any candidate.
+    for cand in candidates:
+        cand_norm = cand.strip().lower()
+        if cand_norm in norm_options:
+            idx = norm_options.index(cand_norm)
+            if is_description_field and "short" in norm_options[idx]:
+                continue
+            return options[idx]
+
+    # Pass 2: substring keyword match against any candidate.
+    for cand in candidates:
+        cand_norm = cand.strip().lower()
+        for i, opt in enumerate(norm_options):
+            if is_description_field and "short" in opt:
+                continue
+            if cand_norm in opt:
+                return options[i]
+
+    return None
+
+
+def guess_composite_key_column(options):
+    """
+    Strict guess for the 6-field composite key column (Age Group+Gender+
+    Article Group+Article Type+Activity Group+Product Division). Only
+    matches a column whose header ACTUALLY CONTAINS "+" joining at least
+    two of the expected field names -- a loose keyword guess (e.g. just
+    "group" or "category") was previously grabbing unrelated columns like
+    "Category ID". Returns None if no such column exists.
+    """
+    field_words = ["age group", "gender", "article group", "article type", "activity group", "product division"]
+    for opt in options:
+        norm = str(opt).strip().lower()
+        if "+" not in norm:
+            continue
+        hit_count = sum(1 for w in field_words if w.replace(" ", "") in norm.replace(" ", ""))
+        if hit_count >= 2:
+            return opt
+    return None
+
+
+def guess_gender_article_group_column(options):
+    """
+    Strict guess for a Gender_ArticleGroup-style key column (the format your
+    actual Size Chart / Size Chart Template sheets use). Matches a column
+    whose header contains both "gender" and "article" (any separator), but
+    rejects anything that also contains "+" (that's the 6-field composite
+    key, a different column) or looks like an ID/name column.
+    """
+    for opt in options:
+        norm = str(opt).strip().lower().replace(" ", "")
+        if "+" in norm:
+            continue
+        if "gender" in norm and "article" in norm:
+            return opt
+    return None
+
+
+def normalize_match_text(s):
+    if s is None:
+        return ""
+    s = str(s).replace("™", "").replace("®", "")
+    s = re.sub(r"[^A-Za-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip().lower()
+    return s
+
+
+# Common typos/misspellings seen in real Gender/Article Group data (e.g. a
+# Size Chart Sheet row literally spelled "Feamle_Cap" instead of
+# "Female_Cap"). Corrected on a per-WORD basis after normalization so a
+# single typo'd cell doesn't silently fail to match forever.
+GENDER_TYPO_CORRECTIONS = {
+    "feamle": "female",
+    "femle": "female",
+    "femal": "female",
+    "mens": "male",
+    "womens": "female",
+    "boy": "boys",
+    "girl": "girls",
+}
+
+
+def correct_gender_typos(normalized_text):
+    """Applies known typo corrections to an already-normalized (lowercase,
+    whitespace-collapsed) string, word by word."""
+    words = normalized_text.split()
+    corrected = [GENDER_TYPO_CORRECTIONS.get(w, w) for w in words]
+    return " ".join(corrected)
+
+
+def expand_gender_article_candidates(raw_sheet_value):
+    """
+    Expands a Gender_ArticleGroup-style sheet value into every individual
+    (gender, article group) key it could represent, handling:
+      - Simple single values: "Male_Top" -> ["male_top"]
+      - Multi-gender cells joined by "/": "Male/Unisex_Footwear" or
+        "Male / Female / Unisex_Headwear" -> one candidate key PER gender
+        listed, each paired with the same article group.
+      - Typos in the gender portion (e.g. "Feamle") corrected via
+        GENDER_TYPO_CORRECTIONS.
+    Returns a list of normalized "gender_articlegroup" strings (using the
+    SAME separator/normalization as build_gender_article_group_key), so a
+    Master Sheet row with a single plain gender still matches a sheet row
+    that lists several genders together in one cell.
+    """
+    if raw_sheet_value is None:
+        return []
+    s = str(raw_sheet_value).strip()
+    if not s or s.lower() == "nan":
+        return []
+
+    # Split on the LAST underscore to separate the gender portion from the
+    # article group portion (article group itself may not contain "_").
+    if "_" in s:
+        gender_part, article_part = s.rsplit("_", 1)
+    else:
+        gender_part, article_part = s, ""
+
+    # Multiple genders in one cell are separated by "/" (with or without
+    # surrounding spaces): "Male/Unisex" or "Male / Female / Unisex".
+    gender_candidates = [g.strip() for g in gender_part.split("/") if g.strip()]
+    if not gender_candidates:
+        gender_candidates = [gender_part]
+
+    article_norm = correct_gender_typos(normalize_match_text(article_part))
+
+    results = []
+    for g in gender_candidates:
+        gender_norm = correct_gender_typos(normalize_match_text(g))
+        results.append(f"{gender_norm}_{article_norm}")
+    return results
+
+
+def clean_title(brand, gender, title, search_color_name_raw, is_footwear=None):
+    """
+    Build title per spec:
+    [NEW] [Brand] [Gender] [Regional Display Name] ( Color)
+    Gender only included when it's "Unisex". Search Color Name is appended
+    for EVERY division, wrapped in PARENTHESES with a leading space inside,
+    e.g. "( White)" -- matching the required sample format exactly.
+    """
+    # NaN (a blank cell) is truthy in Python, so `title or ""` would keep a
+    # NaN float instead of falling back to "" -- crashing re.sub() below
+    # since it requires a string. Coerce properly instead.
+    if title is None or (isinstance(title, float) and pd.isna(title)):
+        title = ""
+    else:
+        title = str(title)
+    for pattern, repl in TITLE_REPLACEMENTS.items():
+        title = re.sub(pattern, repl, title, flags=re.IGNORECASE)
+
+    search_color_name = clean_color_name(search_color_name_raw)
+
+    parts = ["[NEW]"]
+    if brand:
+        parts.append(str(brand).strip())
+    if gender and str(gender).strip().lower() == "unisex":
+        parts.append(str(gender).strip())
+    if title:
+        parts.append(title.strip())
+
+    # remove duplicate words anywhere in the title (case-insensitive), preserve first occurrence
+    seen = set()
+    deduped = []
+    for word in " ".join(parts).split():
+        key = word.lower()
+        if key in seen and key not in ("[new]",):
+            continue
+        seen.add(key)
+        deduped.append(word)
+    base_title = " ".join(deduped).strip()
+
+    if search_color_name:
+        base_title = f"{base_title} ( {search_color_name})"
+
+    return base_title
+
+
+def clean_description(raw_desc, style_number, care=None, care_label=None):
+    if raw_desc is None or (isinstance(raw_desc, float) and pd.isna(raw_desc)):
+        raw_desc = ""
+    desc = str(raw_desc)
+    desc = re.sub(r"<h3>\s*product\s*story\s*</h3>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"product\s*story", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<br\s*/?>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"</br>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<h3>\s*details\s*</h3>", "\n\nDETAILS", desc, flags=re.IGNORECASE)
+    desc = re.sub(
+        r"<h3>\s*features\s*(&|\+)\s*benefits\s*</h3>",
+        "\n\nFEATURES & BENEFITS",
+        desc,
+        flags=re.IGNORECASE,
+    )
+    desc = re.sub(r"<li[^>]*>", "\r\n- ", desc, flags=re.IGNORECASE)
+    for tag in [r"</li>", r"<ul[^>]*>", r"</ul>", r"<p[^>]*>", r"</p>"]:
+        desc = re.sub(tag, "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<[^>]+>", "", desc)
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in desc.splitlines()]
+    lines = [ln for ln in lines if ln != ""]
+    desc = "\n".join(lines).strip()
+    tail = [f"Style : {style_number}"]
+    if care and str(care).strip().lower() not in ("nan", ""):
+        tail.append(f'"CARE"\n{str(care).strip()}')
+    if care_label and str(care_label).strip().lower() not in ("nan", ""):
+        tail.append(f'"CARE LABEL"\n{str(care_label).strip()}')
+    desc = desc + "\n\n" + "\n\n".join(tail)
+    return desc.strip()
+
+
+def build_shopee_description(raw_desc, style_number, care=None, care_label=None):
+    """
+    Ported directly from the Shopee Apps Script description-merge logic
+    (kept for Shopee ONLY -- Lazada continues to use clean_description() /
+    extract_description_main() / extract_productstory() / build_short_description(),
+    completely unchanged). Produces ONE merged description string:
+      - Strips <h3>PRODUCT STORY</h3> variants entirely.
+      - Strips <br/></br>, <br />, and plain <br/> line-break variants.
+      - Converts <h3>DETAILS</h3> -> "\r\n\r\nDETAILS" and
+        <h3>FEATURES & BENEFITS</h3> (or "+ BENEFITS") -> "\r\n\r\nFEATURES & BENEFITS".
+      - Converts <li> -> "\r\n- " bullets; strips </li>, <ul>, </ul>, <p>, </p>.
+      - Appends "\r\n- Style : <style_number>\r\n".
+      - Appends "\r\n\r\nCARE\r\n<care>" and "\r\n\r\nCARE LABEL\r\n<care_label>"
+        when present (unquoted headers, unlike Lazada's quoted "CARE").
+    Uses regex (all occurrences) rather than the original script's plain
+    .replace() (first occurrence only) so multiple <li>/<br> tags are all
+    handled correctly in one pass.
+    """
+    if raw_desc is None or (isinstance(raw_desc, float) and pd.isna(raw_desc)):
+        raw_desc = ""
+    desc = str(raw_desc)
+
+    # Strip <h3>PRODUCT STORY</h3> (any casing/spacing variant) entirely.
+    desc = re.sub(r"<h3>\s*product\s*story\s*</h3>", "", desc, flags=re.IGNORECASE)
+
+    # Strip line breaks: <br/></br>, <br />, <br/>, etc.
+    desc = re.sub(r"<br\s*/?>\s*</br>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<br\s*/?>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"</br>", "", desc, flags=re.IGNORECASE)
+
+    desc = desc.strip()
+
+    # DETAILS / FEATURES & BENEFITS headings -> "\r\n\r\n" + plain text heading.
+    desc = re.sub(r"<h3>\s*details\s*</h3>", "\r\n\r\nDETAILS", desc, flags=re.IGNORECASE)
+    desc = re.sub(
+        r"<h3>\s*features\s*(&|\+)\s*benefits\s*</h3>",
+        "\r\n\r\nFEATURES & BENEFITS",
+        desc,
+        flags=re.IGNORECASE,
+    )
+
+    # <li> -> "\r\n- " bullet; strip </li>, <ul>, </ul>, <p>, </p> entirely.
+    desc = re.sub(r"<li[^>]*>", "\r\n- ", desc, flags=re.IGNORECASE)
+    for tag in [r"</li>", r"<ul[^>]*>", r"</ul>", r"<p[^>]*>", r"</p>"]:
+        desc = re.sub(tag, "", desc, flags=re.IGNORECASE)
+
+    # Append Style line.
+    desc = desc + "\r\n- Style : " + str(style_number) + "\r\n"
+
+    care_val = _clean_field_value(care)
+    care_label_val = _clean_field_value(care_label)
+    if care_val:
+        desc = desc + "\r\n\r\nCARE\r\n" + care_val
+    if care_label_val:
+        desc = desc + "\r\n\r\nCARE LABEL\r\n" + care_label_val
+
+    return desc
+
+
+def is_footwear(product_division):
+    if not product_division:
+        return False
+    return str(product_division).strip().lower() in ("footwear", "shoes", "trainers", "sandals", "slides")
+
+
+def size_sort_key(size_val, is_footwear_row=False):
+    s = str(size_val).strip().upper()
+    if s in ALPHA_SIZE_ORDER:
+        return (0, ALPHA_SIZE_ORDER.index(s), 0, "")
+    try:
+        num = float(re.sub(r"[^\d.]", "", s))
+        return (1, 0, num, "")
+    except (ValueError, TypeError):
+        return (2, 0, 0, s)
+
+
+def _normalize_id_for_match(val):
+    """
+    Normalizes a Category ID (or any numeric-looking key) for comparison.
+    Excel/pandas often reads whole-number IDs as floats when the column has
+    any blank cells (e.g. 1811 -> 1811.0), which would otherwise silently
+    fail a plain string comparison against a sheet storing it as a plain
+    int/string "1811". Strips a trailing ".0" so both forms match.
+    """
+    s = str(val).strip().lower()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+
+def match_lazada_item_specs(category_id, lazada_spec_df, cat_id_col, value_columns):
+    """
+    Looks up the resolved Category ID in the Lazada Item Spec Sheet and
+    returns a dict of {output_column_name: value} for every Product
+    Specification 4..12 column that has a real (non-blank) value in the
+    matched row. LAZADA ONLY. Returns {} if the sheet isn't uploaded, the
+    Category ID doesn't match anything, or the key column is missing --
+    never guesses or fabricates values.
+    """
+    if lazada_spec_df is None or lazada_spec_df.empty:
+        return {}
+    if not category_id or cat_id_col not in lazada_spec_df.columns:
+        return {}
+
+    norm_target = _normalize_id_for_match(category_id)
+    id_col_norm = lazada_spec_df[cat_id_col].apply(_normalize_id_for_match)
+    match = lazada_spec_df[id_col_norm == norm_target]
+    if match.empty:
+        return {}
+
+    row = match.iloc[0]
+    result = {}
+    for col in value_columns:
+        if col in lazada_spec_df.columns:
+            val = _clean_field_value(row.get(col, ""))
+            if val:
+                result[col] = val
+    return result
+
+
+def precompute_category_names(category_df, name_col, id_col):
+    """
+    Precomputes (id, normalized_name, name_length) once per Category Sheet
+    row -- called ONCE before the main per-group loop, instead of
+    re-normalizing every row's Category Name text on every single product
+    group (which was the main performance bottleneck for large Master
+    Sheets: O(groups x rows) redundant regex work reduced to O(rows)).
+    """
+    if category_df is None or category_df.empty:
+        return []
+    if name_col not in category_df.columns or id_col not in category_df.columns:
+        return []
+    result = []
+    for _, row in category_df.iterrows():
+        name_norm = normalize_match_text(row.get(name_col, ""))
+        if name_norm:
+            result.append((row.get(id_col, ""), name_norm, len(name_norm)))
+    return result
+
+
+def match_category_id_by_attributes(attribute_values, category_df, name_col, id_col, precomputed_names=None):
+    """
+    Best-possible-match strategy for a Category Sheet that only has a
+    breadcrumb-style Category Name column (e.g. "Kids' Fashion:Baby
+    Clothing:Beachwear & Accessories") and NO dedicated composite key
+    column -- your actual sheet's structure.
+
+    Scores every Category Name row by how many of the given attribute
+    values (Age Group, Gender, Article Group, Article Type, Activity Group,
+    Product Division) appear as a normalized substring within that row's
+    Category Name, and returns the ID of the row with the highest score.
+    This is the "combination of all available attributes" match required
+    by spec point 1, adapted to a sheet with no explicit key column.
+
+    Pass `precomputed_names` (from precompute_category_names(), computed
+    ONCE outside the per-group loop) to skip re-normalizing the sheet's
+    text on every call -- falls back to computing it fresh if omitted.
+
+    Returns "" if nothing scores above zero -- never guesses blindly.
+    """
+    if precomputed_names is None:
+        precomputed_names = precompute_category_names(category_df, name_col, id_col)
+    if not precomputed_names:
+        return ""
+
+    clean_attrs = [normalize_match_text(a) for a in attribute_values if _clean_field_value(a)]
+    clean_attrs = [a for a in clean_attrs if a]
+    if not clean_attrs:
+        return ""
+
+    best_id = ""
+    best_score = 0
+    best_specificity = 0  # tie-break: prefer the longer/more specific name text matched
+    for id_val, name_norm, name_len in precomputed_names:
+        score = sum(1 for a in clean_attrs if a in name_norm)
+        if score > best_score or (score == best_score and score > 0 and name_len > best_specificity):
+            best_score = score
+            best_specificity = name_len
+            best_id = id_val
+
+    return best_id if best_score > 0 else ""
+
+
+def build_composite_key(age_group, gender, article_group, article_type, activity_group, product_division):
+    """
+    THE single composite lookup key used across ALL THREE mapping sheets
+    (Category, Size Chart, Size Chart Template), built from the Master Input
+    Sheet's respective columns, joined with "+" to match the sheets' shared
+    literal header:
+      "Age Group+Gender+Article Group+Article Type+Activity Group+Product Division"
+    Normalized (case-insensitive, whitespace-collapsed) before comparison so
+    minor formatting differences don't break the match.
+    """
+    parts = [age_group, gender, article_group, article_type, activity_group, product_division]
+    return "+".join(normalize_match_text(p) for p in parts)
+
+
+# Kept as an alias for backward compatibility with any earlier call sites.
+def build_category_key(age_group, gender, article_group, article_type, activity_group, product_division):
+    return build_composite_key(age_group, gender, article_group, article_type, activity_group, product_division)
+
+
+def match_category_id(title, category_df, keyword_col, id_col,
+                       composite_key=None, composite_key_col=None,
+                       attribute_values=None, name_col=None,
+                       precomputed_names=None, precomputed_composite_norm=None):
+    """
+    Resolves Category ID. Strategies, tried in order:
+      1. COMPOSITE KEY exact match (if your Category Sheet has a dedicated
+         key column -- AgeGroup-Gender-ArticleGroup-ArticleType-
+         ActivityGroup-ProductDivision, normalized before comparing).
+      2. ATTRIBUTE-SUBSTRING scoring against a Category Name column (your
+         actual sheet's structure -- breadcrumb-style names, no key column).
+         Uses the combination of all available attributes to find the best
+         match, per spec.
+      3. TITLE keyword match (last-resort fallback).
+    Returns "" (leaving the cell blank) if nothing matches -- existing
+    values are never overwritten with a bad guess.
+
+    Pass `precomputed_names` and `precomputed_composite_norm` (both
+    computed ONCE outside the per-group loop) to avoid redundant
+    normalization work on every single call -- this is what makes
+    generation fast for large Master Sheets. Falls back to computing fresh
+    each call if omitted (slower, but still correct).
+    """
+    if category_df is None or category_df.empty:
+        return ""
+
+    if (composite_key_col and composite_key not in (None, "")
+            and composite_key_col in category_df.columns
+            and id_col in category_df.columns):
+        norm_key = str(composite_key).strip().lower()
+        sheet_keys_norm = (
+            precomputed_composite_norm if precomputed_composite_norm is not None
+            else category_df[composite_key_col].astype(str).apply(normalize_match_text)
+        )
+        key_match = category_df[sheet_keys_norm == norm_key]
+        if not key_match.empty:
+            val = key_match.iloc[0].get(id_col, "")
+            if val and str(val).strip():
+                return val
+
+    if attribute_values and name_col:
+        attr_result = match_category_id_by_attributes(
+            attribute_values, category_df, name_col, id_col, precomputed_names=precomputed_names
+        )
+        if attr_result:
+            return attr_result
+
+    if keyword_col not in category_df.columns or id_col not in category_df.columns:
+        return ""
+    title_lower = str(title).lower()
+    best_match = ""
+    best_len = 0
+    for _, row in category_df.iterrows():
+        kw = str(row.get(keyword_col, "")).strip().lower()
+        if kw and kw in title_lower and len(kw) > best_len:
+            best_match = row.get(id_col, "")
+            best_len = len(kw)
+    return best_match
+
+
+def build_size_chart_image_key(age_group, gender, article_group, article_type, activity_group):
+    """
+    Full composite lookup key for the Size Chart Image URL, built from:
+      AgeGroup-Gender-ArticleGroup-ArticleType-ActivityGroup
+    Normalized (case-insensitive, whitespace-collapsed) before comparison.
+    """
+    parts = [age_group, gender, article_group, article_type, activity_group]
+    return "-".join(normalize_match_text(p) for p in parts)
+
+
+def build_gender_article_group_key(gender, article_group):
+    """
+    Gender+ArticleGroup lookup key, per spec point 2: "Use the Gender +
+    Article Group mapping to identify the correct size chart." Normalized
+    the same way as the other keys, with common typo corrections applied
+    (e.g. "Feamle" -> "female") so a misspelling on either side doesn't
+    silently break the match.
+    """
+    gender_norm = correct_gender_typos(normalize_match_text(gender))
+    article_norm = correct_gender_typos(normalize_match_text(article_group))
+    return f"{gender_norm}_{article_norm}"
+
+
+def precompute_gender_article_lookup(df, key_col):
+    """
+    Precomputes {expanded_candidate_key: row} ONCE for a sheet, instead of
+    re-scanning every row (with expand_gender_article_candidates() re-run
+    each time) on every single product group -- this was the main
+    performance bottleneck for large Master Sheets. First-match-wins on
+    duplicate candidates, matching the previous row-by-row-in-order
+    behavior. Returns {} if the sheet/column isn't available.
+    """
+    lookup = {}
+    if df is None or df.empty or key_col not in df.columns:
+        return lookup
+    for _, row in df.iterrows():
+        for candidate in expand_gender_article_candidates(row.get(key_col, "")):
+            if candidate not in lookup:
+                lookup[candidate] = row
+    return lookup
+
+
+def match_size_chart_image(title, size_chart_image_df, title_col, url_col,
+                            style_number=None, style_col=None,
+                            composite_key=None, composite_key_col=None,
+                            gender_article_key=None, gender_article_key_col=None,
+                            precomputed_ga_lookup=None, precomputed_composite_norm=None):
+    """
+    Resolves the Size Chart Image URL. Strategies, tried in order:
+      1. GENDER + ARTICLE GROUP exact match (PRIMARY): your actual sheet's
+         key column.
+      2. FULL COMPOSITE KEY exact match (fallback): Age Group+Gender+Article
+         Group+Article Type+Activity Group+Product Division, tried if (1)
+         doesn't resolve anything.
+      3. STYLE NUMBER exact match (further fallback).
+      4. TITLE keyword match (last-resort fallback).
+    All comparisons are normalized (case-insensitive, whitespace-collapsed).
+    Returns "" (leaving the cell blank) if nothing matches at all --
+    existing values are never overwritten with a bad guess.
+
+    Pass `precomputed_ga_lookup` (from precompute_gender_article_lookup(),
+    computed ONCE outside the per-group loop) and `precomputed_composite_norm`
+    for O(1) lookups instead of re-scanning the whole sheet on every call.
+    """
+    if size_chart_image_df is None or size_chart_image_df.empty:
+        return ""
+
+    if gender_article_key not in (None, ""):
+        lookup = (
+            precomputed_ga_lookup if precomputed_ga_lookup is not None
+            else precompute_gender_article_lookup(size_chart_image_df, gender_article_key_col)
+        )
+        row = lookup.get(gender_article_key)
+        if row is not None:
+            val = row.get(url_col, "")
+            if val and str(val).strip():
+                return val
+
+    if (composite_key_col and composite_key not in (None, "")
+            and composite_key_col in size_chart_image_df.columns
+            and url_col in size_chart_image_df.columns):
+        norm_key = normalize_match_text(composite_key)
+        sheet_keys_norm = (
+            precomputed_composite_norm if precomputed_composite_norm is not None
+            else size_chart_image_df[composite_key_col].astype(str).apply(normalize_match_text)
+        )
+        key_match = size_chart_image_df[sheet_keys_norm == norm_key]
+        if not key_match.empty:
+            val = key_match.iloc[0].get(url_col, "")
+            if val and str(val).strip():
+                return val
+
+    if style_col and style_number not in (None, "") and style_col in size_chart_image_df.columns and url_col in size_chart_image_df.columns:
+        norm_style = str(style_number).strip().lower()
+        style_match = size_chart_image_df[
+            size_chart_image_df[style_col].astype(str).str.strip().str.lower() == norm_style
+        ]
+        if not style_match.empty:
+            val = style_match.iloc[0].get(url_col, "")
+            if val and str(val).strip():
+                return val
+
+    if title_col not in size_chart_image_df.columns or url_col not in size_chart_image_df.columns:
+        return ""
+    title_norm = normalize_match_text(title)
+    best_match = ""
+    best_len = 0
+    for _, row in size_chart_image_df.iterrows():
+        kw_raw = row.get(title_col, "")
+        kw_norm = normalize_match_text(kw_raw)
+        if kw_norm and kw_norm in title_norm and len(kw_norm) > best_len:
+            url_val = row.get(url_col, "")
+            if url_val and str(url_val).strip():
+                best_match = url_val
+                best_len = len(kw_norm)
+    return best_match
+
+
+def format_size_value(uk_size, is_footwear_row):
+    if uk_size is None or (isinstance(uk_size, float) and pd.isna(uk_size)) or str(uk_size).strip() == "":
+        return ""
+    s = str(uk_size).strip()
+    if s.upper() == "OSFA":
+        s = "One size"
+    if is_footwear_row:
+        return f"UK:{s}"
+    return f"Int:{s}"
+
+
+def build_size_chart_key(gender, article_group):
+    """
+    Size Chart TEMPLATE lookup key: Gender_ArticleGroup, per spec (point 3),
+    normalized (case-insensitive, whitespace-collapsed) before comparison.
+    """
+    parts = [gender, article_group]
+    return "_".join(normalize_match_text(p) for p in parts)
+
+
+def match_size_chart_template(size_chart_key, size_chart_template_df, key_col, attr_col,
+                               precomputed_ga_lookup=None, precomputed_key_norm=None):
+    """
+    Matches the selected key column against the Size Chart Template Sheet.
+    Two strategies, tried in order:
+      1. Gender_ArticleGroup-style expansion match (handles multi-gender
+         cells like "Male/Unisex_Footwear" and typos like "Feamle_Cap").
+      2. Plain normalized equality match -- handles a composite key column
+         like "Age Group+Gender+Article Group+Article Type+Activity
+         Group+Product Division" (no underscore-based gender parsing needed
+         here, just an exact normalized string match).
+    Returns the Template value formatted as "sizechart=<value>" -- if the
+    sheet's value already includes that prefix, it is NOT duplicated.
+    Returns "" (leaving the cell blank) if nothing matches -- never
+    overwrites with a guess.
+
+    Pass `precomputed_ga_lookup` (from precompute_gender_article_lookup(),
+    computed ONCE outside the per-group loop) for an O(1) lookup instead of
+    re-scanning the whole sheet on every call.
+    """
+    if size_chart_template_df is None or size_chart_template_df.empty:
+        return ""
+    if key_col not in size_chart_template_df.columns or attr_col not in size_chart_template_df.columns:
+        return ""
+
+    matched_row = None
+
+    # Strategy 1: Gender_ArticleGroup-style expansion.
+    lookup = (
+        precomputed_ga_lookup if precomputed_ga_lookup is not None
+        else precompute_gender_article_lookup(size_chart_template_df, key_col)
+    )
+    matched_row = lookup.get(size_chart_key)
+
+    # Strategy 2: plain normalized equality (composite key format).
+    if matched_row is None:
+        norm_key = normalize_match_text(size_chart_key)
+        sheet_keys_norm = (
+            precomputed_key_norm if precomputed_key_norm is not None
+            else size_chart_template_df[key_col].astype(str).apply(normalize_match_text)
+        )
+        eq_match = size_chart_template_df[sheet_keys_norm == norm_key]
+        if not eq_match.empty:
+            matched_row = eq_match.iloc[0]
+
+    if matched_row is None:
+        return ""
+
+    raw_val = matched_row.get(attr_col, "")
+    val = _clean_field_value(raw_val) if raw_val is not None else ""
+    if not val:
+        return ""
+    if val.strip().lower().startswith("sizechart="):
+        return val.strip()
+    return f"sizechart={val}"
+
+
+def match_size_chart_by_title(title, size_chart_image_df, title_col, url_col):
+    """
+    NEW: Size Chart column now updates strictly per generated Title, using
+    normalized longest-keyword-in-title matching (same normalization as
+    match_size_chart_image) against the Size Chart Sheet's title column.
+    """
+    return match_size_chart_image(title, size_chart_image_df, title_col, url_col)
+
+
+def precompute_image_lookup(image_df, lookup_col, url_col):
+    """
+    Precomputes {normalized_key: [urls]} ONCE for the Image Sheet, instead
+    of re-filtering the whole sheet on every single product group (the
+    Image Sheet is long/tall format -- many rows per key -- so this was a
+    real cost at scale). Groups by the normalized key in one vectorized
+    pass rather than a per-call boolean-mask scan.
+    """
+    lookup = {}
+    if image_df is None or image_df.empty:
+        return lookup
+    if lookup_col not in image_df.columns or url_col not in image_df.columns:
+        return lookup
+    keys_norm = image_df[lookup_col].astype(str).str.strip()
+    for key, group in image_df.groupby(keys_norm):
+        imgs = []
+        seen = set()
+        for val in group[url_col]:
+            if pd.notna(val) and str(val).strip():
+                url = str(val).strip()
+                if url not in seen:
+                    seen.add(url)
+                    imgs.append(url)
+        lookup[key] = imgs
+    return lookup
+
+
+def get_images_for_key(lookup_value, image_df, lookup_col, url_col, precomputed_lookup=None):
+    if precomputed_lookup is not None:
+        return precomputed_lookup.get(str(lookup_value).strip(), [])
+    if image_df is None or image_df.empty:
+        return []
+    if lookup_col not in image_df.columns or url_col not in image_df.columns:
+        return []
+    lookup_norm = str(lookup_value).strip()
+    matches = image_df[image_df[lookup_col].astype(str).str.strip() == lookup_norm]
+    if matches.empty:
+        return []
+    imgs = []
+    seen = set()
+    for val in matches[url_col]:
+        if pd.notna(val) and str(val).strip():
+            url = str(val).strip()
+            if url not in seen:
+                seen.add(url)
+                imgs.append(url)
+    return imgs
+
+
+def get_price(row, price_col):
+    if price_col not in row or pd.isna(row.get(price_col, None)):
+        return ""
+    return row.get(price_col, "")
+
+
+def extract_search_color_name(raw_color):
+    return clean_color_name(raw_color)
+
+
+def extract_description_main(raw_desc):
+    if raw_desc is None or (isinstance(raw_desc, float) and pd.isna(raw_desc)):
+        return ""
+    desc = str(raw_desc)
+    desc = re.sub(r"<h[1-6]>\s*product\s*story\s*</h[1-6]>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<p>\s*product\s*story\s*</p>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"product\s*story", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"<br\s*/?>", "", desc, flags=re.IGNORECASE)
+    desc = re.sub(r"</br>", "", desc, flags=re.IGNORECASE)
+    split_pattern = re.compile(
+        r"<h[1-6]>\s*(features\s*(&|\+)\s*benefits|details)\s*",
+        re.IGNORECASE
+    )
+    match = split_pattern.search(desc)
+    main_part = desc[:match.start()] if match else desc
+    main_text = re.sub(r"</?p[^>]*>", "", main_part, flags=re.IGNORECASE).strip()
+    main_text = re.sub(r"\s+", " ", main_text).strip()
+    if not main_text:
+        return ""
+    return f"description=<p>{main_text}</p>"
+
+
+def extract_productstory(raw_desc):
+    if raw_desc is None or (isinstance(raw_desc, float) and pd.isna(raw_desc)):
+        return ""
+    desc = str(raw_desc)
+    match = re.search(
+        r"(<h[1-6]>\s*features\s*(&|\+)\s*benefits.*)",
+        desc,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    story_part = match.group(1).strip() if match else ""
+    return f"productstory={story_part}" if story_part else ""
+
+
+def _clean_field_value(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return ""
+    s = str(val).strip()
+    if s == "" or s.lower() in ("nan", "other"):
+        return ""
+    return s
+
+
+def first_nonblank(*values):
+    for v in values:
+        if _clean_field_value(v):
+            return v
+    return ""
+
+
+_MATERIAL_COMPOSITION_PATTERN = re.compile(
+    r"^(Main Material\s*\d*\s*:\s*)?"                          # optional "Main Material N:" prefix
+    r"(\d+%\s*[A-Za-z]+(?:\s+[A-Za-z]+)*"                       # first "NN% word(s)" unit
+    r"(?:,\s*\d+%\s*[A-Za-z]+(?:\s+[A-Za-z]+)*)*)"              # repeated ", NN% word(s)" units
+)
+
+
+def clean_material_for_short_description(raw_material):
+    """
+    Keeps ONLY the actual material composition list (e.g. "Main Material 1:
+    95% polyester, 5% elastane") and drops any trailing technical spec
+    content appended after it -- fabric construction, treatment, weight,
+    codes, print method, etc. This junk shows up in more than one format in
+    real data, e.g.:
+      "...5% elastane-jersey-wicking: chemical-156.00 g/m²-PS/01-CF/002-print: sublimation"
+      "...100% polyester - circular knit - 155.00 g/m² - piece dyed"
+    Rather than pattern-matching the junk itself (which varies), this
+    matches the composition list FORWARD from the start -- a "Main
+    Material N:" prefix (optional) followed by one or more "NN% word(s)"
+    units joined strictly by ", " -- and truncates at the first point that
+    pattern stops holding, regardless of what the trailing junk looks like.
+    If the value has no "NN%" composition pattern at all (e.g. a plain
+    material name like "Genuine Leather" with nothing extra attached), it
+    is returned unchanged.
+    """
+    val = _clean_field_value(raw_material)
+    if not val:
+        return val
+    match = _MATERIAL_COMPOSITION_PATTERN.match(val)
+    if not match or not match.group(2):
+        return val
+    prefix = match.group(1) or ""
+    composition = match.group(2)
+    return (prefix + composition).strip()
+
+
+def build_short_description(brand, color_name, gender, activity_group, collection,
+                             material, toe_type, heel_type,
+                             fastener, fit, puma_technology, technology_purpose, style_number,
+                             is_footwear=False):
+    """
+    Material handling per spec:
+      - Footwear: Material is NEVER included in the Short Description.
+      - Apparel & Accessories: ONLY the plain "Material" value is included --
+        no sub-fields (Material Local, Upper/Mid Sole/Outer Sole/Shell
+        Material) are ever added; those "extra content" fields are dropped
+        entirely from the Short Description for every division. The
+        material value itself is also truncated to just the composition
+        (see clean_material_for_short_description) -- trailing technical
+        spec codes attached to the same cell are stripped out.
+    """
+    fields = [
+        ("Brand", brand),
+        ("Color Name", color_name),
+        ("Gender", gender),
+        ("Activity Group", activity_group),
+        ("Collection", collection),
+    ]
+    if not is_footwear:
+        fields.append(("Material", clean_material_for_short_description(material)))
+    fields.extend([
+        ("Toe Type", toe_type),
+        ("Heel Type", heel_type),
+        ("Fastener", fastener),
+        ("Fit", fit),
+        ("PUMA Technology", puma_technology),
+        ("Technology Purpose", technology_purpose),
+        ("Style Number", style_number),
+    ])
+    items = []
+    for label, raw_val in fields:
+        val = _clean_field_value(raw_val)
+        if val:
+            items.append(f"<li>{label} : {val}</li>")
+    return "<ul>" + "".join(items) + "</ul>"
+
+
+# ======================================================================================
+# CORE TRANSFORMATION
+# ======================================================================================
+
+def build_upload_sheet(master_df, image_df, size_chart_template_df, category_df,
+                        output_columns, price_col,
+                        master_col_map=None,
+                        image_sku_col=None, image_url_col=None,
+                        size_chart_key_col=None, size_chart_attr_col=None,
+                        category_keyword_col=None, category_id_col=None,
+                        category_composite_key_col=None,
+                        category_name_col=None,
+                        size_chart_image_df=None,
+                        size_chart_image_title_col=None, size_chart_image_url_col=None,
+                        size_chart_image_style_col=None,
+                        size_chart_image_composite_key_col=None,
+                        size_chart_image_gender_article_key_col=None,
+                        lazada_item_spec_df=None, lazada_item_spec_cat_id_col=None,
+                        region="PH", marketplace="Lazada"):
+    mc = dict(MASTER_COLS)
+    if master_col_map:
+        mc.update({k: v for k, v in master_col_map.items() if v})
+
+    # Color Family has no dedicated mapping dropdown -- most Master Sheets
+    # don't have a distinct "Color Family" column, so it's auto-derived to
+    # mirror whichever real column was mapped to Color Name. No manual
+    # selection needed.
+    mc["color_family"] = mc["color_name"]
+
+    ic = {
+        "sku": image_sku_col if image_sku_col else IMAGE_SHEET_COLS["sku"],
+        "url_col": image_url_col if image_url_col else IMAGE_SHEET_COLS["url_col"],
+    }
+    sct = {
+        "key": size_chart_key_col if size_chart_key_col else SIZE_CHART_TEMPLATE_COLS["key"],
+        "template_attribute_1": size_chart_attr_col if size_chart_attr_col else SIZE_CHART_TEMPLATE_COLS["template_attribute_1"],
+    }
+    cc = {
+        "keyword": category_keyword_col if category_keyword_col else CATEGORY_SHEET_COLS["keyword"],
+        "category_id": category_id_col if category_id_col else CATEGORY_SHEET_COLS["category_id"],
+        "composite_key": category_composite_key_col,
+        "category_name": category_name_col if category_name_col else CATEGORY_SHEET_COLS["category_name"],
+    }
+    lisc = {
+        "cat_id": lazada_item_spec_cat_id_col if lazada_item_spec_cat_id_col else LAZADA_ITEM_SPEC_COLS["cat_id"],
+    }
+    sci = {
+        "title_keyword": size_chart_image_title_col if size_chart_image_title_col else SIZE_CHART_IMAGE_COLS["title_keyword"],
+        "image_url": size_chart_image_url_col if size_chart_image_url_col else SIZE_CHART_IMAGE_COLS["image_url"],
+        "style_no": size_chart_image_style_col,
+        "composite_key": size_chart_image_composite_key_col,
+        "gender_article_key": size_chart_image_gender_article_key_col,
+    }
+
+    # Mapping log/report data (per General Requirements): tracks per-row
+    # outcomes for Category ID and Size Chart Image URL mapping so a clear
+    # report can be shown after generation.
+    mapping_log = {"category": [], "size_chart_image": [], "size_chart_template": []}
+
+    currency_code = REGION_CURRENCY.get(region, "PHP")
+
+    # --- Precompute all lookup structures ONCE, before the per-group loop,
+    # instead of re-scanning full sheets for every single product group.
+    # This is what makes generation fast for large Master Sheets -- these
+    # were previously the main performance bottleneck. ---
+    precomputed_category_names = precompute_category_names(category_df, cc["category_name"], cc["category_id"])
+    precomputed_category_composite_norm = (
+        category_df[cc["composite_key"]].astype(str).apply(normalize_match_text)
+        if (cc["composite_key"] and category_df is not None and cc["composite_key"] in category_df.columns)
+        else None
+    )
+    precomputed_sct_ga_lookup = precompute_gender_article_lookup(size_chart_template_df, sct["key"])
+    precomputed_sci_ga_lookup = precompute_gender_article_lookup(size_chart_image_df, sci["gender_article_key"])
+    precomputed_sci_composite_norm = (
+        size_chart_image_df[sci["composite_key"]].astype(str).apply(normalize_match_text)
+        if (sci["composite_key"] and size_chart_image_df is not None and sci["composite_key"] in size_chart_image_df.columns)
+        else None
+    )
+    precomputed_image_lookup = precompute_image_lookup(image_df, ic["sku"], ic["url_col"])
+
+    rows = []
+    master_df = master_df.copy()
+
+    def group_key(r):
+        color_no = r.get(mc["color_no"], "")
+        if color_no not in (None, "") and str(color_no).strip() not in ("", "nan"):
+            return f"color__{color_no}"
+        style = r.get(mc["style_no"], "")
+        return f"style__{style}"
+
+    master_df["_group_key"] = master_df.apply(group_key, axis=1)
+
+    for group_key_val, group_df in master_df.groupby("_group_key", sort=False):
+        first = group_df.iloc[0]
+        ptype = first.get(mc["product_type"], "")
+        footwear = is_footwear(ptype)
+
+        gender_val = first.get(mc["gender"], "")
+        # Search Color Name used in Title for EVERY division, with a blank-safe
+        # fallback to Color Name (NOT a plain `or`, since pandas NaN is truthy).
+        title_color_raw = first_nonblank(first.get(mc["search_color_name"], ""), first.get(mc["color_name"], ""))
+        title = clean_title(
+            first.get(mc["brand"], ""),
+            gender_val,
+            first.get(mc["title"], ""),
+            title_color_raw,
+        )
+
+        style_number = first.get(mc["style_no"], "")
+        color_no_val = first.get(mc["color_no"], "")
+        raw_desc = first.get(mc["description"], "")
+        desc = clean_description(
+            raw_desc,
+            style_number,
+            first.get(mc["care"], None),
+            first.get(mc["care_label"], None),
+        )
+
+        color_no_str = str(color_no_val).strip() if color_no_val not in (None, "") and str(color_no_val).strip().lower() != "nan" else ""
+        model_value = color_no_str if color_no_str else str(style_number)
+
+        # --- ALL THREE mappings (Category ID / Size Chart Image URL /
+        # Template Attribute 1) now share ONE composite key, built from the
+        # same 6 Master Sheet attributes, joined with "+" to match your
+        # sheets' shared literal header:
+        #   "Age Group+Gender+Article Group+Article Type+Activity Group+Product Division"
+        # This is tried FIRST for every mapping. Never overwrites with a bad
+        # guess -- stays blank if the key isn't found in a given sheet. ---
+        shared_key_attrs = [
+            first.get(mc["age_group"], ""),
+            gender_val,
+            first.get(mc["article_group"], ""),
+            first.get(mc["article_type"], ""),
+            first.get(mc["activity_group"], ""),
+            ptype,
+        ]
+        shared_composite_key = build_composite_key(*shared_key_attrs)
+
+        # --- 1. Category ID mapping ---
+        category_id = match_category_id(
+            title, category_df, cc["keyword"], cc["category_id"],
+            composite_key=shared_composite_key, composite_key_col=cc["composite_key"],
+            attribute_values=shared_key_attrs, name_col=cc["category_name"],
+            precomputed_names=precomputed_category_names,
+            precomputed_composite_norm=precomputed_category_composite_norm,
+        )
+        mapping_log["category"].append({
+            "SKU/Model": model_value, "Key": shared_composite_key, "Matched": bool(category_id),
+        })
+
+        # --- Lazada Item Spec lookup (LAZADA ONLY): Category ID -> fixed
+        # Product Specification 4..12 values, looked up from the resolved
+        # Category ID above. Parent row only, same pattern as Category ID /
+        # Size Chart Image URL / Template Attribute 1. ---
+        lazada_item_specs = {}
+        if marketplace == "Lazada":
+            lazada_item_specs = match_lazada_item_specs(
+                category_id, lazada_item_spec_df, lisc["cat_id"], LAZADA_ITEM_SPEC_VALUE_COLUMNS
+            )
+
+        # --- 3. Size Chart Template mapping (Template Attribute 1) ---
+        # SHOPEE: skipped entirely -- Template Attribute 1 stays blank for
+        # Shopee, per spec ("no need to update" when Shopee is selected).
+        # LAZADA: unchanged -- Gender_ArticleGroup tried first (your actual
+        # sheet's key column), full composite key as fallback.
+        if marketplace == "Shopee":
+            template_attr_1 = ""
+        else:
+            gender_article_key = build_gender_article_group_key(gender_val, first.get(mc["article_group"], ""))
+            template_attr_1 = match_size_chart_template(
+                gender_article_key, size_chart_template_df, sct["key"], sct["template_attribute_1"],
+                precomputed_ga_lookup=precomputed_sct_ga_lookup,
+            )
+            if not template_attr_1:
+                template_attr_1 = match_size_chart_template(
+                    shared_composite_key, size_chart_template_df, sct["key"], sct["template_attribute_1"],
+                    precomputed_ga_lookup=precomputed_sct_ga_lookup,
+                )
+            mapping_log["size_chart_template"].append({
+                "SKU/Model": model_value, "Key": gender_article_key, "Matched": bool(template_attr_1),
+            })
+
+        # --- 2. Size Chart Image URL mapping (unaffected by marketplace --
+        # still resolved for both Lazada and Shopee, per spec: only Template
+        # Attribute 1 is the one skipped for Shopee). ---
+        gender_article_key_for_image = build_gender_article_group_key(gender_val, first.get(mc["article_group"], ""))
+        size_chart_image_url = match_size_chart_image(
+            title, size_chart_image_df, sci["title_keyword"], sci["image_url"],
+            style_number=style_number, style_col=sci["style_no"],
+            composite_key=shared_composite_key, composite_key_col=sci["composite_key"],
+            gender_article_key=gender_article_key_for_image, gender_article_key_col=sci["gender_article_key"],
+            precomputed_ga_lookup=precomputed_sci_ga_lookup,
+            precomputed_composite_norm=precomputed_sci_composite_norm,
+        )
+        mapping_log["size_chart_image"].append({
+            "SKU/Model": model_value, "Key": gender_article_key_for_image, "Matched": bool(size_chart_image_url),
+        })
+
+        # --- Description-family fields: Template Attribute 2/3, Short
+        # Description, Product Description 1. ---
+        # SHOPEE: all FOUR fields get the SAME merged description, built via
+        # the Shopee Apps Script logic (build_shopee_description) -- style,
+        # care, and care label merged into one flat description string.
+        # LAZADA: completely unchanged from before -- separate logic for
+        # each field (extract_description_main / extract_productstory /
+        # build_short_description bullet list / fixed USER_TEMPLATE_NAME).
+        if marketplace == "Shopee":
+            shopee_description = build_shopee_description(
+                raw_desc, style_number,
+                first.get(mc["care"], None), first.get(mc["care_label"], None),
+            )
+            template_attr_2 = shopee_description
+            template_attr_3 = shopee_description
+            short_description = shopee_description
+            product_description_1 = shopee_description
+        else:
+            template_attr_2 = extract_description_main(raw_desc)
+            template_attr_3 = extract_productstory(raw_desc)
+            short_description = build_short_description(
+                brand=_clean_field_value(first.get(mc["brand"], "")) or "PUMA",
+                color_name=extract_search_color_name(title_color_raw),
+                gender=gender_val,
+                activity_group=first.get(mc["activity_group"], ""),
+                collection=first.get(mc["collection"], ""),
+                material=first.get(mc["material"], ""),
+                toe_type=first.get(mc["toe_type"], ""),
+                heel_type=first.get(mc["heel_type"], ""),
+                fastener=first.get(mc["fastener"], ""),
+                fit=first.get(mc["fit"], ""),
+                puma_technology=first.get(mc["puma_technology"], ""),
+                technology_purpose=first.get(mc["technology_purpose"], ""),
+                style_number=style_number,
+                is_footwear=footwear,
+            )
+            product_description_1 = USER_TEMPLATE_NAME
+
+        total_variation_count = len(group_df)
+
+        base_row = {
+            "Product Description 1": product_description_1,
+            "Product Name": title,
+            "Title": title,
+            "Description": desc,
+            "Short Description": short_description,
+            "Currency Code": currency_code,
+            "Quantity": 0,
+            "Tax Class": "Default",
+            "Brand": "PUMA",
+            "Model": model_value,
+            "Warranty Type": "No Warranty",
+            "Package Weight (kg)": 0.5,
+            "Weight (Kg)": 0.5,
+            "Package Height(cm)": 15,
+            "Package Length(cm)": 12,
+            "Package Width(cm)": 12,
+            # Shopee-only: fixed shipping service value, applied identically
+            # to every row (Parent and Child alike) since it's in base_row.
+            "Shipping Service": "Doorstep Delivery:1.75" if marketplace == "Shopee" else "",
+            "Shipping Service Details": "Doorstep Delivery:1.75" if marketplace == "Shopee" else "",
+            "What's in the Box": f"1 X {title}",
+            "Template Attribute 2": template_attr_2,
+            "Template Attribute 3": template_attr_3,
+            "Region": region,
+            "Marketplace": marketplace,
+        }
+
+        parent_sku_value = model_value
+
+        child_records = group_df.to_dict("records")
+        child_records.sort(
+            key=lambda r: (
+                str(r.get(mc["color_family"], "")),
+                str(r.get(mc["color_name"], "")),
+                size_sort_key(r.get(mc["uk_size"], r.get(mc["size"], "")), footwear),
+            )
+        )
+
+        first_child_color_name = ""
+        first_child_formatted_size = ""
+        first_child_price = ""
+        if child_records:
+            first_rec = child_records[0]
+            first_child_color_name = clean_color_name(first_rec.get(mc["color_name"], ""))
+            first_child_formatted_size = format_size_value(first_rec.get(mc["uk_size"], ""), footwear)
+            first_child_price = get_price(first_rec, price_col)
+
+        # Product Specification 1/2/3 differ by marketplace:
+        #   LAZADA: sku.color_family= / sku.size= / normal.delivery_option_economy=
+        #           (unchanged from before).
+        #   SHOPEE: Product Specification 1 = "Brand=PUMA"; 2 and 3 are left
+        #           blank -- none of the Lazada sku.*/normal.* values apply.
+        if marketplace == "Shopee":
+            parent_spec_1 = "Brand=PUMA"
+            parent_spec_2 = ""
+            parent_spec_3 = ""
+        else:
+            parent_spec_1 = f"sku.color_family={first_child_color_name}"
+            parent_spec_2 = f"sku.size={first_child_formatted_size}"
+            parent_spec_3 = 'normal.delivery_option_economy=["No",]'
+
+        # Parent row's Variation 1/2 HEADER LABELS differ by marketplace:
+        #   LAZADA: literal "color_family" / "size" (unchanged).
+        #   SHOPEE: "Color" / "Size".
+        if marketplace == "Shopee":
+            parent_variation_1_label = "Color"
+            parent_variation_2_label = "Size"
+        else:
+            parent_variation_1_label = "color_family"
+            parent_variation_2_label = "size"
+
+        parent_images = "; ".join(get_images_for_key(model_value, image_df, ic["sku"], ic["url_col"], precomputed_lookup=precomputed_image_lookup))
+        parent_row = {
+            "Row Type": "Parent",
+            **base_row,
+            "SKU": parent_sku_value,
+            "Seller SKU": parent_sku_value,
+            "Parent SKU": "",
+            "Total variation": total_variation_count,
+            "Variation 1": parent_variation_1_label,
+            "Variation 2": parent_variation_2_label,
+            "Stock": 0,
+            "RRP": first_child_price,
+            "Images": parent_images,
+            "Product Image URL(s)": parent_images,
+            "Image URL": parent_images,
+            "Product Specification 1": parent_spec_1,
+            "Product Specification 2": parent_spec_2,
+            "Product Specification 3": parent_spec_3,
+            # Parent-only mapping fields -- Category ID / Size Chart Image
+            # URL / Template Attribute 1 are set ONLY on the Parent row.
+            "Category ID": category_id,
+            "Size Chart Image URL": size_chart_image_url,
+            "Template Attribute 1": template_attr_1,
+            # Lazada Item Spec lookup result (Product Specification 4..12),
+            # merged in last so it doesn't get overwritten by anything above.
+            **lazada_item_specs,
+        }
+        rows.append(parent_row)
+
+        # Reuse parent_images for every child in this group instead of
+        # re-running the same lookup once per child -- model_value (the
+        # image lookup key) is identical for every child within a group.
+        child_images = parent_images
+
+        for rec in child_records:
+            sku = rec.get(mc["sku"], "")
+            color_name = clean_color_name(rec.get(mc["color_name"], ""))
+            uk_size_raw = rec.get(mc["uk_size"], "")
+            formatted_size = format_size_value(uk_size_raw, footwear)
+
+            if marketplace == "Shopee":
+                child_spec_1 = "Brand=PUMA"
+                child_spec_2 = ""
+            else:
+                child_spec_1 = f"sku.color_family={color_name}"
+                child_spec_2 = f"sku.size={formatted_size}"
+
+            child_row = {
+                "Row Type": "Child",
+                **base_row,
+                "Description": "",
+                # Parent-only fields: these should appear only on the Parent
+                # row, never repeated on Child rows.
+                "Product Description 1": "",
+                "Short Description": "",
+                "Template Attribute 2": "",
+                "Template Attribute 3": "",
+                "SKU": sku,
+                "Seller SKU": sku,
+                "Parent SKU": parent_sku_value,
+                "Total variation": "",
+                "RRP": get_price(rec, price_col),
+                "Variation 1": color_name,
+                "Variation 2": formatted_size,
+                "Product Specification 1": child_spec_1,
+                "Product Specification 2": child_spec_2,
+                "Stock": 0,
+                "Images": child_images,
+                "Product Image URL(s)": child_images,
+                "Image URL": child_images,
+            }
+            rows.append(child_row)
+
+    out_df = pd.DataFrame(rows)
+
+    parent_count = int((out_df["Row Type"] == "Parent").sum()) if "Row Type" in out_df.columns else 0
+    child_count = int((out_df["Row Type"] == "Child").sum()) if "Row Type" in out_df.columns else 0
+
+    # Match Sample Upload Format columns to computed columns CASE-INSENSITIVELY
+    # and with surrounding whitespace ignored. A single-letter case mismatch
+    # (e.g. sample says "Size chart Image URL" but the code computed "Size
+    # Chart Image URL") would otherwise silently produce a blank column even
+    # though the data was computed correctly -- this prevents that class of
+    # bug for every column, not just one.
+    out_cols_by_norm = {str(c).strip().lower(): c for c in out_df.columns}
+    for col in output_columns:
+        if col in out_df.columns:
+            continue
+        norm = str(col).strip().lower()
+        if norm in out_cols_by_norm:
+            out_df[col] = out_df[out_cols_by_norm[norm]]
+        else:
+            out_df[col] = ""
+    out_df = out_df[output_columns]
+
+    resolved_cols = {"sci": sci, "sct": sct, "cc": cc}
+    return out_df, parent_count, child_count, mapping_log, resolved_cols
+
+
+# ======================================================================================
+# STREAMLIT UI
+# ======================================================================================
+
+st.set_page_config(page_title="Marketplace Upload Sheet Generator", layout="wide")
+st.title("🛒 Marketplace Bulk Upload Sheet Generator")
+
+st.markdown(
+    """
+Upload your source sheets below. **Master Sheet column mapping is done in the UI**
+(see the "Map Master Sheet columns" section once you upload it).
+
+**Updates in this version:**
+- Title now shows the Search Color Name in **parentheses**, e.g. `( White)`.
+- **Size Chart Image URL** is now matched strictly against the generated **Title**
+  (normalized keyword match), instead of loosely matching arbitrary keywords.
+"""
+)
+
+st.markdown("### 🌏 Region & Marketplace")
+rcol1, rcol2 = st.columns(2)
+with rcol1:
+    selected_region = st.selectbox("Region", options=REGIONS, index=REGIONS.index("PH"))
+with rcol2:
+    selected_marketplace = st.selectbox("Marketplace", options=MARKETPLACES, index=MARKETPLACES.index("Lazada"))
+
+st.markdown("### 📁 Source Files")
+col1, col2 = st.columns(2)
+with col1:
+    master_file = st.file_uploader("Master Input Sheet (.xlsx/.csv)", type=["xlsx", "csv"], key="master")
+    image_file = st.file_uploader("Image Sheet (.xlsx/.csv)", type=["xlsx", "csv"], key="images")
+    category_file = st.file_uploader("Category Sheet (.xlsx/.csv)", type=["xlsx", "csv"], key="category")
+    size_chart_image_file = st.file_uploader(
+        "Size Chart Sheet (.xlsx/.csv) — provides the Size Chart Image URL, matched by Title",
+        type=["xlsx", "csv"], key="sizechartimage",
+    )
+with col2:
+    size_chart_template_file = st.file_uploader(
+        "Size Chart Template Sheet (.xlsx/.csv) — provides Template Attribute 1, direct key lookup",
+        type=["xlsx", "csv"], key="sizecharttemplate"
+    )
+    lazada_item_spec_file = st.file_uploader(
+        "Lazada Item Spec Sheet (.xlsx/.csv) — LAZADA ONLY, Category ID → Product Specification 4-12",
+        type=["xlsx", "csv"], key="lazadaitemspec",
+    )
+    sample_file = st.file_uploader(
+        "Sample Upload Format (.xlsx/.csv) — REQUIRED, defines exact output columns",
+        type=["xlsx", "csv"], key="sample",
+    )
+
+
+def load_any(f):
+    if f is None:
+        return None
+    if f.name.lower().endswith(".csv"):
+        return pd.read_csv(f)
+    return pd.read_excel(f)
+
+
+price_col = MASTER_COLS["price"]
+master_col_map = {}
+
+if master_file is not None:
+    _master_preview_df = load_any(master_file)
+    master_file.seek(0)
+    master_cols_available = list(_master_preview_df.columns)
+
+    if not master_cols_available:
+        st.error(
+            "⚠️ The uploaded Master Input Sheet has NO columns/headers -- it appears "
+            "to be empty. The Master Sheet mapping section can't populate any dropdowns "
+            "until you upload a file that actually has a header row and data. Please "
+            "check the file and re-upload."
+        )
+
+    st.markdown("#### 📌 Master Sheet — Column Mapping")
+    st.caption(
+        "Map every field to the matching column in your uploaded Master Sheet."
+    )
+
+    # Split fields into two groups: REQUIRED fields (always shown, need your
+    # attention) vs OPTIONAL Short-Description-only fields (auto-detected by
+    # keyword matching -- same as the Image Sheet's column guessing -- and
+    # tucked into a collapsed section so they don't clutter the main view.
+    # The auto-guess still runs and populates master_col_map even if you
+    # never open that section, so the result is identical either way.
+    required_fields = [(k, label, req) for (k, label, req) in MASTER_COLS_FIELDS if req]
+    optional_fields = [(k, label, req) for (k, label, req) in MASTER_COLS_FIELDS if not req]
+
+    with st.expander("Map Master Sheet columns", expanded=True):
+        none_option = "— not in my sheet —"
+        options_with_none = [none_option] + master_cols_available
+
+        mcol1, mcol2 = st.columns(2)
+        for i, (field_key, field_label, required) in enumerate(required_fields):
+            default_header = MASTER_COLS[field_key]
+            # Tries every known naming-convention variant for this field
+            # (compact "StyleNo" AND verbose "Style Number", etc.) so
+            # auto-detection works regardless of which Master Sheet
+            # convention is uploaded -- see MASTER_COLS_CANDIDATES.
+            auto_guess = guess_master_column(master_cols_available, field_key, default_header)
+            default_idx = (
+                options_with_none.index(auto_guess) if auto_guess and auto_guess in options_with_none else 0
+            )
+            target_col = mcol1 if i % 2 == 0 else mcol2
+            with target_col:
+                chosen = st.selectbox(
+                    f"{field_label} *",
+                    options=options_with_none,
+                    index=default_idx,
+                    key=f"master_col_map_{field_key}_v4",
+                )
+                master_col_map[field_key] = "" if chosen == none_option else chosen
+
+        # Optional Short-Description fields are auto-detected by keyword
+        # matching (same approach as the Image Sheet's column guessing) and
+        # tucked into a collapsed section below so they don't clutter the
+        # main view -- the auto-guess becomes each selectbox's default value,
+        # and still applies even if you never open the section.
+        with st.expander("Optional: Short Description detail fields (auto-detected — click to override)", expanded=False):
+            ocol1, ocol2 = st.columns(2)
+            for i, (field_key, field_label, required) in enumerate(optional_fields):
+                default_header = MASTER_COLS[field_key]
+                base_keyword = field_label.split(" (")[0].strip().lower()
+                auto_guess = guess_column_or_none(
+                    master_cols_available, default_header, keywords=[base_keyword]
+                )
+                # No match found -> default to "not in my sheet" instead of
+                # silently guessing an unrelated column.
+                default_idx = (
+                    options_with_none.index(auto_guess) if auto_guess and auto_guess in options_with_none else 0
+                )
+                target_col = ocol1 if i % 2 == 0 else ocol2
+                with target_col:
+                    chosen = st.selectbox(
+                        field_label,
+                        options=options_with_none,
+                        index=default_idx,
+                        key=f"master_col_map_{field_key}_v4",
+                    )
+                    master_col_map[field_key] = "" if chosen == none_option else chosen
+
+        st.markdown("#### 📌 Price Column")
+        default_price_idx = (
+            master_cols_available.index(price_col) if price_col in master_cols_available else 0
+        )
+        price_col = st.selectbox(
+            "Price column in Master Input Sheet",
+            options=master_cols_available,
+            index=default_price_idx,
+            key="master_price_col_select",
+        )
+
+size_chart_key_col = SIZE_CHART_TEMPLATE_COLS["key"]
+size_chart_attr_col = SIZE_CHART_TEMPLATE_COLS["template_attribute_1"]
+
+if size_chart_template_file is not None:
+    _sct_preview_df = load_any(size_chart_template_file)
+    size_chart_template_file.seek(0)
+    sct_cols_available = list(_sct_preview_df.columns)
+
+    st.markdown("#### 📌 Size Chart Template Sheet — Column Selection")
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        default_key_guess = (
+            guess_composite_key_column(sct_cols_available)
+            or guess_gender_article_group_column(sct_cols_available)
+        )
+        default_key_idx = (
+            sct_cols_available.index(default_key_guess) if default_key_guess in sct_cols_available else 0
+        )
+        size_chart_key_col = st.selectbox(
+            "Size chart Name",
+            options=sct_cols_available,
+            index=default_key_idx,
+            key="size_chart_key_col_select_v5",
+        )
+    with sc2:
+        default_attr_guess = guess_column_or_none(
+            sct_cols_available, size_chart_attr_col, keywords=["size chart template", "sizechart", "template"]
+        ) or size_chart_attr_col
+        default_attr_idx = (
+            sct_cols_available.index(default_attr_guess) if default_attr_guess in sct_cols_available else 0
+        )
+        size_chart_attr_col = st.selectbox(
+            "Size chart Template",
+            options=sct_cols_available,
+            index=default_attr_idx,
+            key="size_chart_attr_col_select_v3",
+        )
+
+size_chart_image_title_col = SIZE_CHART_IMAGE_COLS["title_keyword"]
+size_chart_image_url_col = SIZE_CHART_IMAGE_COLS["image_url"]
+size_chart_image_style_col = None
+
+if size_chart_image_file is not None:
+    _sci_preview_df = load_any(size_chart_image_file)
+    size_chart_image_file.seek(0)
+    sci_cols_available = list(_sci_preview_df.columns)
+
+    st.markdown("#### 📌 Size Chart Sheet — Column Selection")
+
+    sci1, sci2 = st.columns(2)
+    with sci1:
+        default_sci_key_guess = (
+            guess_column_or_none(sci_cols_available, "Gender_ArticleGroup", keywords=["gender_articlegroup"])
+            or guess_composite_key_column(sci_cols_available)
+            or guess_gender_article_group_column(sci_cols_available)
+        )
+        default_sci_key_idx = (
+            sci_cols_available.index(default_sci_key_guess) if default_sci_key_guess in sci_cols_available else 0
+        )
+        _sci_key_value = st.selectbox(
+            "Size Chart Template Name",
+            options=sci_cols_available,
+            index=default_sci_key_idx,
+            key="size_chart_image_key_col_select_v5",
+        )
+    with sci2:
+        default_sci_url_guess = (
+            guess_column_or_none(sci_cols_available, "Size chart link", keywords=["size chart link"])
+            or guess_column_or_none(sci_cols_available, size_chart_image_url_col, keywords=["link", "url", "image"])
+            or size_chart_image_url_col
+        )
+        default_sci_url_idx = (
+            sci_cols_available.index(default_sci_url_guess) if default_sci_url_guess in sci_cols_available else 0
+        )
+        size_chart_image_url_col = st.selectbox(
+            "Size chart link",
+            options=sci_cols_available,
+            index=default_sci_url_idx,
+            key="size_chart_image_url_col_select_v3",
+        )
+
+    # Feed the single chosen key column into BOTH match strategies -- whichever
+    # one it actually is (Gender_ArticleGroup format or composite format),
+    # the matcher tries it as both, and only one will ever find a hit.
+    size_chart_image_gender_article_key_col = _sci_key_value
+    size_chart_image_composite_key_col = _sci_key_value
+    size_chart_image_title_col = None
+    size_chart_image_style_col = None
+else:
+    size_chart_image_style_col = None
+    size_chart_image_composite_key_col = None
+    size_chart_image_gender_article_key_col = None
+
+category_keyword_col = CATEGORY_SHEET_COLS["keyword"]
+category_id_col = CATEGORY_SHEET_COLS["category_id"]
+category_composite_key_col = None
+category_name_col = CATEGORY_SHEET_COLS["category_name"]
+
+if category_file is not None:
+    _cat_preview_df = load_any(category_file)
+    category_file.seek(0)
+    cat_cols_available = list(_cat_preview_df.columns)
+
+    st.markdown("#### 📌 Category Sheet — Column Selection")
+    st.caption(
+        "PRIMARY match: composite key column, joined from Age Group+Gender+Article "
+        "Group+Article Type+Activity Group+Product Division. If your sheet doesn't "
+        "have this column, the Category Name column is scored against all available "
+        "Master Sheet attributes instead (breadcrumb-style names). Title Keyword is "
+        "a last-resort fallback."
+    )
+    cat_none_option = "— not in my sheet / skip —"
+    cat_key_options = [cat_none_option] + cat_cols_available
+    default_cat_key_guess = guess_composite_key_column(cat_cols_available)
+    default_cat_key_idx = (
+        cat_key_options.index(default_cat_key_guess) if default_cat_key_guess in cat_key_options else 0
+    )
+    cat_key_label = (
+        f"Composite key column (detected in this sheet: \"{default_cat_key_guess}\")"
+        if default_cat_key_guess else "Composite key column (none detected in this sheet)"
+    )
+    _cat_key_choice = st.selectbox(
+        cat_key_label,
+        options=cat_key_options,
+        index=default_cat_key_idx,
+        key="category_composite_key_col_select_v3",
+    )
+    category_composite_key_col = None if _cat_key_choice == cat_none_option else _cat_key_choice
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        default_name_guess = guess_column_or_none(
+            cat_cols_available, category_name_col, keywords=["category name", "name"]
+        ) or category_name_col
+        default_name_idx = (
+            cat_cols_available.index(default_name_guess) if default_name_guess in cat_cols_available else 0
+        )
+        category_name_col = st.selectbox(
+            "Category Name column (attribute-based best-match)",
+            options=cat_cols_available,
+            index=default_name_idx,
+            key="category_name_col_select",
+        )
+    with cc2:
+        default_id_idx = (
+            cat_cols_available.index(category_id_col) if category_id_col in cat_cols_available else 0
+        )
+        category_id_col = st.selectbox(
+            "Category ID column",
+            options=cat_cols_available,
+            index=default_id_idx,
+            key="category_id_col_select",
+        )
+
+    cc3, cc4 = st.columns(2)
+    with cc3:
+        cat_kw_none_option = "— not in my sheet / skip —"
+        cat_kw_options = [cat_kw_none_option] + cat_cols_available
+        default_kw_idx = (
+            cat_kw_options.index(category_keyword_col) if category_keyword_col in cat_kw_options else 0
+        )
+        _cat_kw_choice = st.selectbox(
+            "Title Keyword column (optional last-resort fallback)",
+            options=cat_kw_options,
+            index=default_kw_idx,
+            key="category_keyword_col_select",
+        )
+        category_keyword_col = "" if _cat_kw_choice == cat_kw_none_option else _cat_kw_choice
+
+# --- Lazada Item Spec Sheet — Column Selection (LAZADA ONLY) ---
+lazada_item_spec_cat_id_col = LAZADA_ITEM_SPEC_COLS["cat_id"]
+
+if lazada_item_spec_file is not None:
+    _lisc_preview_df = load_any(lazada_item_spec_file)
+    lazada_item_spec_file.seek(0)
+    lisc_cols_available = list(_lisc_preview_df.columns)
+
+    st.markdown("#### 📌 Lazada Item Spec Sheet — Column Selection")
+    st.caption(
+        "Matched against the resolved Category ID -- LAZADA ONLY. Product "
+        "Specification 4 through 12 columns in this sheet are copied "
+        "straight to the same-named output columns on the Parent row; "
+        "only the Category ID key column needs mapping below."
+    )
+    default_lisc_idx = guess_column_index(
+        lisc_cols_available, lazada_item_spec_cat_id_col, keywords=["cat id", "category id", "cat_id"]
+    )
+    lazada_item_spec_cat_id_col = st.selectbox(
+        "Category ID column",
+        options=lisc_cols_available,
+        index=default_lisc_idx,
+        key="lazada_item_spec_cat_id_col_select",
+    )
+
+image_sku_col = IMAGE_SHEET_COLS["sku"]
+image_url_col = IMAGE_SHEET_COLS["url_col"]
+
+if image_file is not None:
+    _img_preview_df = load_any(image_file)
+    image_file.seek(0)
+    img_cols_available = list(_img_preview_df.columns)
+
+    st.markdown("#### 📌 Image Sheet — Column Selection")
+    st.caption(
+        "Your Image Sheet is a long/tall list — one row per image, with the SAME "
+        "Color Number repeating across multiple rows."
+    )
+    ic1, ic2 = st.columns(2)
+    with ic1:
+        default_img_sku_idx = guess_column_index(
+            img_cols_available, image_sku_col, keywords=["color number", "colornumber", "color no", "color"]
+        )
+        image_sku_col = st.selectbox(
+            "Color Number column in Image Sheet",
+            options=img_cols_available,
+            index=default_img_sku_idx,
+            key="image_sku_col_select",
+        )
+    with ic2:
+        default_img_url_idx = guess_column_index(
+            img_cols_available, image_url_col, keywords=["url", "link", "image"]
+        )
+        image_url_col = st.selectbox(
+            "Image URL / Link column in Image Sheet",
+            options=img_cols_available,
+            index=default_img_url_idx,
+            key="image_url_col_select",
+        )
+
+    if image_sku_col == image_url_col:
+        st.warning(
+            "⚠️ Color Number column and Image URL column are set to the SAME column "
+            "— images will not resolve correctly. Please pick two different columns above."
+        )
+
+
+if st.button("🚀 Generate Upload Sheet", type="primary"):
+    if master_file is None:
+        st.error("Master Input Sheet is required.")
+    elif sample_file is None:
+        st.error("Sample Upload Format is required — it defines the exact output columns/order.")
+    else:
+        if image_file is None:
+            st.warning(
+                "⚠️ No Image Sheet uploaded — every 'Product Image URL(s)' value will be "
+                "blank in the output."
+            )
+        if size_chart_image_file is None:
+            st.warning(
+                "⚠️ No Size Chart Sheet uploaded — 'Size chart Image URL' will be blank "
+                "for every row."
+            )
+        if size_chart_template_file is None:
+            st.warning(
+                "⚠️ No Size Chart Template Sheet uploaded — 'Template Attribute 1' will be "
+                "blank for every row."
+            )
+        if category_file is None:
+            st.warning(
+                "⚠️ No Category Sheet uploaded — 'Category ID' will be blank for every row."
+            )
+        if selected_marketplace == "Lazada" and lazada_item_spec_file is None:
+            st.warning(
+                "⚠️ No Lazada Item Spec Sheet uploaded — 'Product Specification 4' onward "
+                "will be blank for every row."
+            )
+
+        with st.spinner("Processing..."):
+            master_df = load_any(master_file)
+            image_df = load_any(image_file)
+            size_chart_template_df = load_any(size_chart_template_file)
+            size_chart_image_df = load_any(size_chart_image_file)
+            category_df = load_any(category_file)
+            lazada_item_spec_df = load_any(lazada_item_spec_file)
+            sample_df = load_any(sample_file)
+
+            output_columns = list(sample_df.columns)
+
+            try:
+                result_df, parent_count, child_count, mapping_log, resolved_cols = build_upload_sheet(
+                    master_df, image_df, size_chart_template_df, category_df, output_columns,
+                    price_col=price_col,
+                    master_col_map=master_col_map,
+                    image_sku_col=image_sku_col,
+                    image_url_col=image_url_col,
+                    size_chart_key_col=size_chart_key_col,
+                    size_chart_attr_col=size_chart_attr_col,
+                    category_keyword_col=category_keyword_col,
+                    category_id_col=category_id_col,
+                    category_composite_key_col=category_composite_key_col,
+                    category_name_col=category_name_col,
+                    size_chart_image_df=size_chart_image_df,
+                    size_chart_image_title_col=size_chart_image_title_col,
+                    size_chart_image_url_col=size_chart_image_url_col,
+                    size_chart_image_style_col=size_chart_image_style_col,
+                    size_chart_image_composite_key_col=size_chart_image_composite_key_col,
+                    size_chart_image_gender_article_key_col=size_chart_image_gender_article_key_col,
+                    lazada_item_spec_df=lazada_item_spec_df,
+                    lazada_item_spec_cat_id_col=lazada_item_spec_cat_id_col,
+                    region=selected_region,
+                    marketplace=selected_marketplace,
+                )
+            except KeyError as e:
+                st.error(
+                    f"Column mapping mismatch: {e}. "
+                    "Please adjust the column mappings above to match your actual sheet's headers, then rerun."
+                )
+                st.stop()
+
+        st.success(f"Generated {len(result_df)} rows ({parent_count} parent, {child_count} child).")
+
+        # --- Mapping log/report (per General Requirements): shows successfully
+        # mapped rows, unmatched rows, and missing mapping combinations for
+        # each of the three mappings, without needing to inspect the full sheet.
+        # Auto-expands and shows real diagnostics (sheet uploaded? actual key
+        # values found in the sheet vs what was attempted) whenever a mapping
+        # has ZERO matches, so a "why is this blank" question is answerable
+        # directly from this report instead of guessing. ---
+        mapping_defs = [
+            ("Category ID", "category", category_df, resolved_cols["cc"]["composite_key"] or resolved_cols["cc"]["category_name"]),
+            ("Size Chart Image URL", "size_chart_image", size_chart_image_df, resolved_cols["sci"]["gender_article_key"] or resolved_cols["sci"]["composite_key"]),
+            ("Template Attribute 1 (Size Chart Template)", "size_chart_template", size_chart_template_df, resolved_cols["sct"]["key"]),
+        ]
+        any_zero_match = any(
+            pd.DataFrame(mapping_log[key])["Matched"].sum() == 0
+            for _, key, _, _ in mapping_defs
+            if not pd.DataFrame(mapping_log[key]).empty
+        )
+        with st.expander(
+            "📋 Mapping Report (Category ID / Size Chart Image URL / Template Attribute 1)",
+            expanded=any_zero_match,
+        ):
+            for label, key, sheet_df, sheet_key_col in mapping_defs:
+                log_df = pd.DataFrame(mapping_log[key])
+                if log_df.empty:
+                    continue
+                matched_count = int(log_df["Matched"].sum())
+                total_count = len(log_df)
+                unmatched_df = log_df[~log_df["Matched"]]
+                st.markdown(f"**{label}:** {matched_count} / {total_count} groups matched")
+
+                if sheet_df is None:
+                    st.error(f"⚠️ No sheet was uploaded for {label} -- this is why it's entirely blank. Upload the sheet above.")
+                    continue
+
+                if not unmatched_df.empty:
+                    missing_keys = sorted(unmatched_df["Key"].unique().tolist())
+                    st.caption(f"{len(unmatched_df)} unmatched row(s). Keys attempted from your Master Sheet:")
+                    st.dataframe(pd.DataFrame({"Key attempted (from Master Sheet)": missing_keys}), use_container_width=True)
+
+                    if matched_count == 0 and sheet_key_col and sheet_key_col in sheet_df.columns:
+                        sheet_sample_keys = sorted(
+                            sheet_df[sheet_key_col].astype(str).dropna().unique().tolist()
+                        )[:15]
+                        st.caption(f"Actual values found in your sheet's \"{sheet_key_col}\" column (compare against the attempted keys above):")
+                        st.dataframe(pd.DataFrame({f'Values in "{sheet_key_col}"': sheet_sample_keys}), use_container_width=True)
+                        st.info(
+                            "If NONE of the attempted keys appear (even loosely) in the actual sheet values above, "
+                            "the Master Sheet's Gender/Article Group/etc. column mapping is likely pointing at the "
+                            "wrong column, or producing blank values -- double-check the 'Map Master Sheet columns' "
+                            "section further up."
+                        )
+                    elif matched_count == 0 and (not sheet_key_col or sheet_key_col not in sheet_df.columns):
+                        st.error(
+                            f"⚠️ The key column selected for this sheet (\"{sheet_key_col}\") doesn't actually exist "
+                            "in the uploaded file -- please re-check the column dropdown above."
+                        )
+
+        st.dataframe(result_df, use_container_width=True)
+
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            result_df.to_excel(writer, index=False, sheet_name="Upload")
+        buffer.seek(0)
+
+        st.download_button(
+            "⬇️ Download Upload Sheet (.xlsx)",
+            data=buffer,
+            file_name="marketplace_upload_sheet.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+else:
+    st.info("Upload your files and click **Generate Upload Sheet** to begin.")
